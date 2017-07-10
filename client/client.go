@@ -694,7 +694,7 @@ func (c *Client) globOnePattern(pattern string, s *metric.Span) (entries, links 
 // Create implements upspin.Client.
 func (c *Client) Create(name upspin.PathName) (upspin.File, error) {
 	// TODO: Make sure directory exists?
-	return file.Writable(c, name), nil
+	return file.Writable(c, name)
 }
 
 // Open implements upspin.Client.

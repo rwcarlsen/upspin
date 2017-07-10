@@ -6,11 +6,17 @@
 package file // import "upspin.io/client/file"
 
 import (
+	"bytes"
 	"io"
 
+	"upspin.io/access"
+	"upspin.io/bind"
 	"upspin.io/client/clientutil"
 	"upspin.io/errors"
+	"upspin.io/flags"
+	"upspin.io/metric"
 	"upspin.io/pack"
+	"upspin.io/path"
 	"upspin.io/upspin"
 )
 
@@ -27,10 +33,10 @@ type File struct {
 	offset   int64           // File location for next read or write operation. Constrained to <= maxInt.
 	writable bool            // File is writable (made with Create, not Open).
 	closed   bool            // Whether the file has been closed, preventing further operations.
+	entry    *upspin.DirEntry
 
 	// Used only by readers.
 	config upspin.Config
-	entry  *upspin.DirEntry
 	size   int64
 	bu     upspin.BlockUnpacker
 	// Keep the most recently unpacked block around
@@ -39,8 +45,10 @@ type File struct {
 	lastBlockBytes []byte
 
 	// Used only by writers.
-	client upspin.Client // Client the File belongs to.
-	data   []byte        // Contents of file.
+	dstname    upspin.PathName // fully resolved (i.e. links followed) path for writing
+	client     upspin.Client   // Client the File belongs to.
+	data       []byte          // Contents of file.
+	bufferFull bool
 }
 
 var _ upspin.File = (*File)(nil)
@@ -78,12 +86,29 @@ func Readable(cfg upspin.Config, entry *upspin.DirEntry) (*File, error) {
 // Writable creates a new file with a given name, belonging to a given
 // client for write. Once closed, the file will overwrite any existing
 // file with the same name.
-func Writable(client upspin.Client, name upspin.PathName) *File {
-	return &File{
-		client:   client,
-		name:     name,
-		writable: true,
+func Writable(client upspin.Client, name upspin.PathName) (*File, error) {
+	// Find the Access file that applies. This will also cause us to evaluate links in the path,
+	// and if we do, evalEntry will contain the true file name of the Put operation we will do.
+	accessEntry, evalEntry, err := client.lookup(op, &upspin.DirEntry{Name: parsed.Path()}, whichAccessLookupFn, followFinalLink, s)
+	if err != nil {
+		return nil, errors.E(op, err)
 	}
+	dstname := evalEntry.Name
+	isAccessFile := access.IsAccessFile(dstname)
+	isGroupFile := access.IsGroupFile(dstname)
+
+	f := &File{
+		client:     client,
+		name:       name,
+		writable:   true,
+		dstname:    dstname,
+		bufferFull: isAccessFile || isGroupFile,
+	}
+	err = f.startStreamingWrite()
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
 // Name implements upspin.File.
@@ -173,12 +198,28 @@ func (f *File) readAt(op string, dst []byte, off int64) (n int, err error) {
 	return n, nil
 }
 
+// switchBufferFull puts the file into full buffering mode from a streaming-write mode.
+func (f *File) switchBufferFull() error {
+	if f.bufferFull {
+		return nil
+	}
+	f.bufferFull = true
+
+	panic("unimplemented")
+
+	return nil
+}
+
 // Seek implements upspin.File.
 func (f *File) Seek(offset int64, whence int) (ret int64, err error) {
 	const op = "file.Seek"
 	if f.closed {
 		return 0, f.errClosed(op)
 	}
+	if err := f.switchBufferFull(); err != nil {
+		return 0, errors.E(op, err)
+	}
+
 	switch whence {
 	case 0:
 		ret = offset
@@ -206,13 +247,150 @@ func (f *File) Write(b []byte) (n int, err error) {
 	n, err = f.writeAt(op, b, f.offset)
 	if err == nil {
 		f.offset += int64(n)
+	} else {
+		return n, err
+	}
+
+	if !f.bufferFull {
+		err = f.streamingWrite()
 	}
 	return n, err
+}
+
+func (f *File) startStreamingWrite() error {
+	parsed, err := path.Parse(f.name)
+	if err != nil {
+		return errors.E(op, err)
+	}
+
+	// Find the Access file that applies. This will also cause us to evaluate links in the path,
+	// and if we do, evalEntry will contain the true file name of the Put operation we will do.
+	accessEntry, evalEntry, err := f.client.lookup(op, &upspin.DirEntry{Name: parsed.Path()}, whichAccessLookupFn, followFinalLink, s)
+
+	if err != nil {
+		return errors.E(op, err)
+	}
+	name = evalEntry.Name
+	readers, err := f.client.getReaders(op, name, accessEntry)
+	if err != nil {
+		return errors.E(op, name, err)
+	}
+
+	isAccessFile := access.IsAccessFile(name)
+	isGroupFile := access.IsGroupFile(name)
+	var packer upspin.Packer
+	if isAccessFile || isGroupFile || f.client.isReadableByAll(readers) {
+		packer = pack.Lookup(upspin.EEIntegrityPack)
+	} else {
+		// Encrypt data according to the preferred packer
+		packer = pack.Lookup(f.config.Packing())
+		if packer == nil {
+			return errors.E(op, name, errors.Errorf("unrecognized Packing %d", f.config.Packing()))
+		}
+	}
+
+	f.entry = &upspin.DirEntry{
+		Name:       f.name,
+		SignedName: f.name,
+		Packing:    packer.Packing(),
+		Sequence:   upspin.SeqIgnore,
+		Writer:     f.config.UserName(),
+		Link:       "",
+		Attr:       upspin.AttrNone,
+	}
+
+	ss = s.StartSpan("addReaders")
+	if err := f.client.addReaders(op, f.entry, packer, readers); err != nil {
+		return err
+	}
+	ss.End()
+
+	return nil
+}
+
+func (f *File) streamingWrite() error {
+	if len(f.data) < flags.BlockSize {
+		return nil
+	}
+	// TODO: track metrics here like in client.Put
+
+	ss := s.StartSpan("pack")
+	const notfinal = false
+	if err := c.pack(entry, packer, ss, notfinal); err != nil {
+		return nil, errors.E(op, err)
+	}
+	ss.End()
+}
+
+func (f *File) endStreamingWrite() error {
+	ss := s.StartSpan("pack")
+	const final = true
+	if err := c.pack(f.entry, packer, ss, final); err != nil {
+		return nil, errors.E(op, err)
+	}
+	ss.End()
+
+	f.entry.Time = upspin.Now()
+
+	// We have evaluated links so can use DirServer.Put directly.
+	dir, err := f.client.DirServer(name)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	defer s.StartSpan("dir.Put").End()
+	if e, err := dir.Put(entry); err != nil {
+		return e, err
+	}
+	return entry, nil
+}
+
+func (f *File) pack(entry *upspin.DirEntry, packer upspin.Packer, s *metric.Span, final bool) error {
+	// Start the I/O.
+	store, err := bind.StoreServer(f.config, f.config.StoreEndpoint())
+	if err != nil {
+		return err
+	}
+	bp, err := packer.Pack(f.config, f.entry)
+	if err != nil {
+		return err
+	}
+	for len(f.data) > flags.BlockSize || final {
+		n := len(f.data)
+		if n > flags.BlockSize {
+			n = flags.BlockSize
+		}
+		ss := s.StartSpan("bp.pack")
+		cipher, err := bp.Pack(f.data[:n])
+		ss.End()
+		if err != nil {
+			return err
+		}
+
+		f.data = f.data[:copy(f.data, f.data[n:])]
+
+		ss = s.StartSpan("store.Put")
+		refdata, err := store.Put(cipher)
+		ss.End()
+		if err != nil {
+			return err
+		}
+		bp.SetLocation(
+			upspin.Location{
+				Endpoint:  c.config.StoreEndpoint(),
+				Reference: refdata.Reference,
+			},
+		)
+	}
+	return bp.Close()
 }
 
 // WriteAt implements upspin.File.
 func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
 	const op = "file.WriteAt"
+	if err := f.switchBufferFull(); err != nil {
+		return 0, errors.E(op, err)
+	}
 	return f.writeAt(op, b, off)
 }
 
@@ -250,7 +428,7 @@ func (f *File) writeAt(op string, b []byte, off int64) (n int, err error) {
 }
 
 // Close implements upspin.File.
-func (f *File) Close() error {
+func (f *File) Close() (err error) {
 	const op = "file.Close"
 	if f.closed {
 		return f.errClosed(op)
@@ -264,9 +442,45 @@ func (f *File) Close() error {
 		}
 		return nil
 	}
-	_, err := f.client.Put(f.name, f.data)
+	if f.bufferFull {
+		err = validateAccess(op)
+		if err != nil {
+			return err
+		}
+		_, err = f.client.Put(f.name, f.data)
+	} else {
+		err = f.endStreamingWrite()
+	}
 	f.data = nil // Might as well release it early.
 	return err
+}
+
+func (f *File) validateAccess(op string) error {
+	isAccessFile := access.IsAccessFile(f.name)
+	isGroupFile := access.IsGroupFile(f.name)
+	// Ensure Access file is valid.
+	if isAccessFile {
+		r = bytes.NewBuffer(f.data)
+		a, err := access.Parse(name, f.data)
+		if err != nil {
+			return errors.E(op, name, err)
+		}
+		if a.IsReadableByAll() {
+			// Check that we're not adding read:all to encrypted files.
+			if err := c.readAllOK(parsed); err != nil {
+				return errors.E(op, name, err)
+			}
+		}
+	}
+	// Ensure Group file is valid.
+	if isGroupFile {
+		r = bytes.NewBuffer(f.data)
+		_, err = access.ParseGroup(parsed, f.data)
+		if err != nil {
+			return errors.E(op, name, err)
+		}
+	}
+	return nil
 }
 
 func (f *File) errClosed(op string) error {
