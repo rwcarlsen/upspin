@@ -279,15 +279,6 @@ func (c *Client) pack(entry *upspin.DirEntry, data []byte, packer upspin.Packer,
 	return bp.Close()
 }
 
-func whichAccessLookupFn(dir upspin.DirServer, entry *upspin.DirEntry, s *metric.Span) (*upspin.DirEntry, error) {
-	defer s.StartSpan("dir.WhichAccess").End()
-	whichEntry, err := dir.WhichAccess(entry.Name)
-	if err != nil {
-		return whichEntry, err
-	}
-	return whichEntry, validateWhichAccess(entry.Name, whichEntry)
-}
-
 // validateWhichAccess validates that the DirEntry for an Access file as
 // returned by the DirServer's WhichAccess function for name is not forged.
 func validateWhichAccess(name upspin.PathName, accessEntry *upspin.DirEntry) error {

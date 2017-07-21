@@ -89,7 +89,7 @@ func Readable(cfg upspin.Config, entry *upspin.DirEntry) (*File, error) {
 func Writable(client upspin.Client, name upspin.PathName) (*File, error) {
 	// Find the Access file that applies. This will also cause us to evaluate links in the path,
 	// and if we do, evalEntry will contain the true file name of the Put operation we will do.
-	accessEntry, evalEntry, err := client.lookup(op, &upspin.DirEntry{Name: parsed.Path()}, whichAccessLookupFn, followFinalLink, s)
+	accessEntry, evalEntry, err := clientutil.Lookup(cfg, op, &upspin.DirEntry{Name: parsed.Path()}, clientutil.WhichAccessLookupFn, followFinalLink, s)
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
@@ -257,6 +257,11 @@ func (f *File) Write(b []byte) (n int, err error) {
 	return n, err
 }
 
+const (
+	followFinalLink      = true
+	doNotFollowFinalLink = false
+)
+
 func (f *File) startStreamingWrite() error {
 	parsed, err := path.Parse(f.name)
 	if err != nil {
@@ -265,7 +270,7 @@ func (f *File) startStreamingWrite() error {
 
 	// Find the Access file that applies. This will also cause us to evaluate links in the path,
 	// and if we do, evalEntry will contain the true file name of the Put operation we will do.
-	accessEntry, evalEntry, err := f.client.lookup(op, &upspin.DirEntry{Name: parsed.Path()}, whichAccessLookupFn, followFinalLink, s)
+	accessEntry, evalEntry, err := clientutil.Lookup(cfg, op, &upspin.DirEntry{Name: parsed.Path()}, whichAccessLookupFn, followFinalLink, s)
 
 	if err != nil {
 		return errors.E(op, err)
