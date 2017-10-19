@@ -43,6 +43,9 @@ func New(config upspin.Config) upspin.Client {
 	return &Client{config: config}
 }
 
+// Config implements upspin.Client.
+func (c *Client) Config() upspin.Config { return c.config }
+
 // PutLink implements upspin.Client.
 func (c *Client) PutLink(oldName, linkName upspin.PathName) (*upspin.DirEntry, error) {
 	const op = "client.PutLink"
@@ -116,7 +119,7 @@ func (c *Client) Put(name upspin.PathName, data []byte) (*upspin.DirEntry, error
 		return nil, errors.E(op, err)
 	}
 	name = evalEntry.Name
-	readers, err := c.getReaders(op, name, accessEntry)
+	readers, err := clientutil.GetReaders(c, name, accessEntry)
 	if err != nil {
 		return nil, errors.E(op, name, err)
 	}
@@ -359,48 +362,6 @@ func (c *Client) addReaders(op string, entry *upspin.DirEntry, packer upspin.Pac
 	packdata[0] = &entry.Packdata
 	packer.Share(c.config, readersPublicKey, packdata)
 	return nil
-}
-
-// getReaders returns the list of intended readers for the given name
-// according to the Access file.
-// If the Access file cannot be read because of lack of permissions,
-// it returns the owner of the file (but only if we are not the owner).
-func (c *Client) getReaders(op string, name upspin.PathName, accessEntry *upspin.DirEntry) ([]upspin.UserName, error) {
-	if accessEntry == nil {
-		// No Access file present, therefore we must be the owner.
-		return nil, nil
-	}
-	accessData, err := c.Get(accessEntry.Name)
-	if errors.Match(errors.E(errors.NotExist), err) || errors.Match(errors.E(errors.Permission), err) || errors.Match(errors.E(errors.Private), err) {
-		// If we failed to get the Access file for access-control
-		// reasons, then we must not have read access and thus
-		// cannot know the list of readers.
-		// Instead, just return the owner as the only reader.
-		parsed, err := path.Parse(name)
-		if err != nil {
-			return nil, err
-		}
-		owner := parsed.User()
-		if owner == c.config.UserName() {
-			// We are the owner, but the caller always
-			// adds the us, so return an empty list.
-			return nil, nil
-		}
-		return []upspin.UserName{owner}, nil
-	} else if err != nil {
-		// We failed to fetch the Access file for some unexpected reason,
-		// so bubble the error up.
-		return nil, err
-	}
-	acc, err := access.Parse(accessEntry.Name, accessData)
-	if err != nil {
-		return nil, err
-	}
-	readers, err := acc.Users(access.Read, c.Get)
-	if err != nil {
-		return nil, err
-	}
-	return readers, nil
 }
 
 // isReadableByAll returns true if all@upspin.io has read rights.
@@ -809,7 +770,7 @@ func (c *Client) dupOrRename(op string, oldName, newName upspin.PathName, rename
 		if err != nil {
 			return nil, errors.E(op, trueOldName, err)
 		}
-		readers, err := c.getReaders(op, trueOldName, accessEntry)
+		readers, err := clientutil.GetReaders(c, trueOldName, accessEntry)
 		if err != nil {
 			return nil, errors.E(op, trueOldName, err)
 		}

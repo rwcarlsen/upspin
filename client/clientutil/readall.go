@@ -125,7 +125,7 @@ func ReadLocation(cfg upspin.Config, loc upspin.Location) ([]byte, error) {
 // according to the Access file.
 // If the Access file cannot be read because of lack of permissions,
 // it returns the owner of the file (but only if we are not the owner).
-func GetReaders(cfg upspin.Config, name upspin.PathName, accessEntry *upspin.DirEntry) ([]upspin.UserName, error) {
+func GetReaders(c upspin.Client, name upspin.PathName, accessEntry *upspin.DirEntry) ([]upspin.UserName, error) {
 	if accessEntry == nil {
 		// No Access file present, therefore we must be the owner.
 		return nil, nil
@@ -141,7 +141,7 @@ func GetReaders(cfg upspin.Config, name upspin.PathName, accessEntry *upspin.Dir
 			return nil, err
 		}
 		owner := parsed.User()
-		if owner == c.config.UserName() {
+		if owner == c.Config().UserName() {
 			// We are the owner, but the caller always
 			// adds the us, so return an empty list.
 			return nil, nil

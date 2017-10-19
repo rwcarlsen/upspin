@@ -645,6 +645,8 @@ type StoreServer interface {
 // of the DirEntry will be different from the argument path name and
 // will hold the link-free path to item.
 type Client interface {
+	// Config returns the client's underlying Config.
+	Config() Config
 	// Get returns the clear, decrypted data stored under the given name.
 	// It is intended only for special purposes, since it will allocate memory
 	// for the entire "blob" to return. The file-like API below can be less

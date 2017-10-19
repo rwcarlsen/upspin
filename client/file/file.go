@@ -6,7 +6,6 @@
 package file // import "upspin.io/client/file"
 
 import (
-	"bytes"
 	"io"
 
 	"upspin.io/access"
@@ -45,10 +44,11 @@ type File struct {
 	lastBlockBytes []byte
 
 	// Used only by writers.
-	dstname    upspin.PathName // fully resolved (i.e. links followed) path for writing
 	client     upspin.Client   // Client the File belongs to.
 	data       []byte          // Contents of file.
+	dstname    upspin.PathName // fully resolved (i.e. links followed) path for writing
 	bufferFull bool
+	bp         upspin.BlockPacker
 }
 
 var _ upspin.File = (*File)(nil)
@@ -87,13 +87,23 @@ func Readable(cfg upspin.Config, entry *upspin.DirEntry) (*File, error) {
 // client for write. Once closed, the file will overwrite any existing
 // file with the same name.
 func Writable(client upspin.Client, name upspin.PathName) (*File, error) {
-	// Find the Access file that applies. This will also cause us to evaluate links in the path,
-	// and if we do, evalEntry will contain the true file name of the Put operation we will do.
-	accessEntry, evalEntry, err := clientutil.Lookup(cfg, op, &upspin.DirEntry{Name: parsed.Path()}, clientutil.WhichAccessLookupFn, followFinalLink, s)
+	const op = "file.Writable"
+	m, s := newMetric(op)
+	defer m.Done()
+
+	parsed, err := path.Parse(name)
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
-	dstname := evalEntry.Name
+
+	// For Access and Group files, we buffer their entire contents locally
+	// instead of doing a streaming write because we need to check their
+	// validity before finalizing the write.
+	accessEntry, evalEntry, err := clientutil.Lookup(f.client.Config(), op, &upspin.DirEntry{Name: parsed.Path()}, clientutil.WhichAccessLookupFn, followFinalLink, s)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+	dstname = evalEntry.Name
 	isAccessFile := access.IsAccessFile(dstname)
 	isGroupFile := access.IsGroupFile(dstname)
 
@@ -104,7 +114,7 @@ func Writable(client upspin.Client, name upspin.PathName) (*File, error) {
 		dstname:    dstname,
 		bufferFull: isAccessFile || isGroupFile,
 	}
-	err = f.startStreamingWrite()
+	err = f.startStreamingWrite(op, accessEntry, evalEntry)
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +262,7 @@ func (f *File) Write(b []byte) (n int, err error) {
 	}
 
 	if !f.bufferFull {
-		err = f.streamingWrite()
+		err = f.streamingWrite(false)
 	}
 	return n, err
 }
@@ -262,111 +272,95 @@ const (
 	doNotFollowFinalLink = false
 )
 
-func (f *File) startStreamingWrite() error {
-	parsed, err := path.Parse(f.name)
-	if err != nil {
-		return errors.E(op, err)
-	}
-
-	// Find the Access file that applies. This will also cause us to evaluate links in the path,
-	// and if we do, evalEntry will contain the true file name of the Put operation we will do.
-	accessEntry, evalEntry, err := clientutil.Lookup(cfg, op, &upspin.DirEntry{Name: parsed.Path()}, whichAccessLookupFn, followFinalLink, s)
-
-	if err != nil {
-		return errors.E(op, err)
-	}
+func (f *File) startStreamingWrite(op string, accessEntry, evalEntry *upspin.DirEntry) error {
 	name = evalEntry.Name
-	readers, err := f.client.getReaders(op, name, accessEntry)
-	if err != nil {
-		return errors.E(op, name, err)
-	}
 
-	isAccessFile := access.IsAccessFile(name)
-	isGroupFile := access.IsGroupFile(name)
-	var packer upspin.Packer
-	if isAccessFile || isGroupFile || f.client.isReadableByAll(readers) {
-		packer = pack.Lookup(upspin.EEIntegrityPack)
-	} else {
-		// Encrypt data according to the preferred packer
-		packer = pack.Lookup(f.config.Packing())
-		if packer == nil {
-			return errors.E(op, name, errors.Errorf("unrecognized Packing %d", f.config.Packing()))
-		}
+	// Encrypt data according to the preferred packer
+	packer := pack.Lookup(f.client.Config().Packing())
+	if packer == nil {
+		return nil, errors.E(op, name, errors.Errorf("unrecognized Packing %d", c.config.Packing()))
 	}
 
 	f.entry = &upspin.DirEntry{
-		Name:       f.name,
-		SignedName: f.name,
+		Name:       name,
+		SignedName: name,
 		Packing:    packer.Packing(),
+		Time:       upspin.Now(),
 		Sequence:   upspin.SeqIgnore,
-		Writer:     f.config.UserName(),
+		Writer:     f.client.Config().UserName(),
 		Link:       "",
 		Attr:       upspin.AttrNone,
 	}
 
-	ss = s.StartSpan("addReaders")
-	if err := f.client.addReaders(op, f.entry, packer, readers); err != nil {
+	bp, err := packer.Pack(f.config, f.entry)
+	if err != nil {
 		return err
 	}
-	ss.End()
+	f.bp = bp
 
 	return nil
 }
 
-func (f *File) streamingWrite() error {
-	if len(f.data) < flags.BlockSize {
+func (f *File) streamingWrite(final bool) error {
+	if len(f.data) < flags.BlockSize && !final {
 		return nil
 	}
 	// TODO: track metrics here like in client.Put
 
 	ss := s.StartSpan("pack")
-	const notfinal = false
-	if err := c.pack(entry, packer, ss, notfinal); err != nil {
+	if err := f.pack(f.entry, ss, final); err != nil {
 		return nil, errors.E(op, err)
 	}
 	ss.End()
 }
 
-func (f *File) endStreamingWrite() error {
-	ss := s.StartSpan("pack")
-	const final = true
-	if err := c.pack(f.entry, packer, ss, final); err != nil {
-		return nil, errors.E(op, err)
+func (f *File) endStreamingWrite(op string) error {
+	f.streamingWrite(true)
+	err := f.bp.Close()
+	if err != nil {
+		return err
 	}
-	ss.End()
 
-	f.entry.Time = upspin.Now()
+	readers, err := clientutil.GetReaders(f.client.Config(), name, accessEntry)
+	if err != nil {
+		return errors.E(op, f.name, err)
+	}
+	if err := clientutil.AddReaders(op, f.entry, f.entry.Packing, readers); err != nil {
+		return errors.E(op, f.name, err)
+	}
 
 	// We have evaluated links so can use DirServer.Put directly.
-	dir, err := f.client.DirServer(name)
+	dir, err := c.DirServer(f.dstname)
 	if err != nil {
-		return nil, errors.E(op, err)
+		return errors.E(op, f.name, err)
 	}
 
-	defer s.StartSpan("dir.Put").End()
-	if e, err := dir.Put(entry); err != nil {
-		return e, err
+	e, err := dir.Put(f.entry)
+	if err != nil {
+		return errors.E(op, f.name, err)
 	}
-	return entry, nil
+	// dir.Put returns an incomplete entry, with the updated sequence number.
+	if e != nil { // TODO: Can be nil only when talking to old servers.
+		entry.Sequence = e.Sequence
+	}
+	return nil
 }
 
-func (f *File) pack(entry *upspin.DirEntry, packer upspin.Packer, s *metric.Span, final bool) error {
+func (f *File) pack(entry *upspin.DirEntry, s *metric.Span, final bool) error {
+	packer := entry.Packing
 	// Start the I/O.
 	store, err := bind.StoreServer(f.config, f.config.StoreEndpoint())
 	if err != nil {
 		return err
 	}
-	bp, err := packer.Pack(f.config, f.entry)
-	if err != nil {
-		return err
-	}
+
 	for len(f.data) > flags.BlockSize || final {
 		n := len(f.data)
 		if n > flags.BlockSize {
 			n = flags.BlockSize
 		}
 		ss := s.StartSpan("bp.pack")
-		cipher, err := bp.Pack(f.data[:n])
+		cipher, err := f.bp.Pack(f.data[:n])
 		ss.End()
 		if err != nil {
 			return err
@@ -380,14 +374,14 @@ func (f *File) pack(entry *upspin.DirEntry, packer upspin.Packer, s *metric.Span
 		if err != nil {
 			return err
 		}
-		bp.SetLocation(
+		f.bp.SetLocation(
 			upspin.Location{
 				Endpoint:  c.config.StoreEndpoint(),
 				Reference: refdata.Reference,
 			},
 		)
 	}
-	return bp.Close()
+	return nil
 }
 
 // WriteAt implements upspin.File.
@@ -461,30 +455,28 @@ func (f *File) Close() (err error) {
 }
 
 func (f *File) validateAccess(op string) error {
-	isAccessFile := access.IsAccessFile(f.name)
-	isGroupFile := access.IsGroupFile(f.name)
+	parsed, err := path.Parse(f.name)
+	if err != nil {
+		return err
+	}
+
+	isAccessFile := access.IsAccessFile(f.dstname)
+	isGroupFile := access.IsGroupFile(f.dstname)
 	// Ensure Access file is valid.
-	if isAccessFile {
-		r = bytes.NewBuffer(f.data)
-		a, err := access.Parse(name, f.data)
+	if access.IsAccessFile(f.dstname) {
+		_, err := access.Parse(f.name, f.data)
 		if err != nil {
-			return errors.E(op, name, err)
-		}
-		if a.IsReadableByAll() {
-			// Check that we're not adding read:all to encrypted files.
-			if err := c.readAllOK(parsed); err != nil {
-				return errors.E(op, name, err)
-			}
+			return errors.E(op, f.name, err)
 		}
 	}
 	// Ensure Group file is valid.
-	if isGroupFile {
-		r = bytes.NewBuffer(f.data)
-		_, err = access.ParseGroup(parsed, f.data)
+	if access.IsGroupFile(name) {
+		_, err := access.ParseGroup(parsed, f.data)
 		if err != nil {
 			return errors.E(op, name, err)
 		}
 	}
+
 	return nil
 }
 
