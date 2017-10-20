@@ -109,6 +109,10 @@ type dummyClient struct {
 
 var _ upspin.Client = (*dummyClient)(nil)
 
+func (d *dummyClient) Config() upspin.Config {
+	return nil
+}
+
 func (d *dummyClient) Get(name upspin.PathName) ([]byte, error) {
 	return nil, nil
 }
