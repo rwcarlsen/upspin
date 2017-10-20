@@ -11,8 +11,12 @@ import (
 	"upspin.io/upspin"
 )
 
-func create(name upspin.PathName) upspin.File {
-	return Writable(&dummyClient{}, name)
+func create(t *testing.T, name upspin.PathName) upspin.File {
+	f, err := Writable(&dummyClient{}, name)
+	if err != nil {
+		t.Fatal("create file: ", err)
+	}
+	return f
 }
 
 const (
@@ -24,7 +28,7 @@ var (
 )
 
 func TestWriteAndClose(t *testing.T) {
-	f := create(fileName)
+	f := create(t, fileName)
 	n, err := f.Write([]byte(dummyData))
 	if err != nil {
 		t.Fatalf("Expected no error, got %v", err)
@@ -51,7 +55,7 @@ func TestFileOverflow(t *testing.T) {
 		fileName = user + "/" + "file"
 	)
 	// Write.
-	f := create(fileName)
+	f := create(t, fileName)
 	defer f.Close()
 	buf := make([]byte, maxInt)
 	n, err := f.Write(buf)
@@ -88,7 +92,7 @@ func TestFileOverflow(t *testing.T) {
 		t.Fatal("seek past file: expected error")
 	}
 	// One more trick: Create empty file, then check seek.
-	f = create(fileName + "x")
+	f = create(t, fileName+"x")
 	defer f.Close()
 	n64, err = f.Seek(maxInt, 0)
 	if err != nil {
