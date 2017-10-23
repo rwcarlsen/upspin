@@ -93,50 +93,34 @@ func newMetric(op string) (*metric.Metric, *metric.Span) {
 
 const followFinalLink = true
 
-// Writable creates a new file with a given name, belonging to a given
-// client for write. Once closed, the file will overwrite any existing
-// file with the same name.
-func Writable(client upspin.Client, name upspin.PathName) (*File, error) {
-	const op = "file.Writable"
-	m, s := newMetric(op)
-	defer m.Done()
-
-	parsed, err := path.Parse(name)
+func (f *File) initWrite(op string, s *metric.Span) error {
+	parsed, err := path.Parse(f.name)
 	if err != nil {
-		return nil, errors.E(op, err)
+		return errors.E(op, err)
 	}
 
 	// For Access and Group files, we buffer their entire contents locally
 	// instead of doing a streaming write because we need to check their
 	// validity before finalizing the write.
-	accessEntry, evalEntry, err := clientutil.Lookup(client, op, &upspin.DirEntry{Name: parsed.Path()}, clientutil.WhichAccessLookupFn, followFinalLink, s)
+	accessEntry, evalEntry, err := clientutil.Lookup(f.client, op, &upspin.DirEntry{Name: parsed.Path()}, clientutil.WhichAccessLookupFn, followFinalLink, s)
 	if err != nil {
-		return nil, errors.E(op, err)
+		return errors.E(op, err)
 	}
-	dstname := evalEntry.Name
-	isAccessFile := access.IsAccessFile(dstname)
-	isGroupFile := access.IsGroupFile(dstname)
+
+	f.dstname = evalEntry.Name
+	f.bufferAll = access.IsAccessFile(f.dstname) || access.IsGroupFile(f.dstname)
+	f.accessEntry = accessEntry
 
 	// Encrypt data according to the preferred packer
-	packer := pack.Lookup(client.Config().Packing())
-	if packer == nil {
-		return nil, errors.E(op, name, errors.Errorf("unrecognized Packing %d", client.Config().Packing()))
-	}
-
-	f := &File{
-		client:      client,
-		name:        name,
-		writable:    true,
-		dstname:     dstname,
-		bufferAll:   isAccessFile || isGroupFile,
-		accessEntry: accessEntry,
-		packer:      packer,
+	f.packer = pack.Lookup(f.client.Config().Packing())
+	if f.packer == nil {
+		return errors.E(op, f.name, errors.Errorf("unrecognized Packing %d", f.client.Config().Packing()))
 	}
 
 	f.entry = &upspin.DirEntry{
-		Name:       dstname,
-		SignedName: dstname,
-		Packing:    packer.Packing(),
+		Name:       f.dstname,
+		SignedName: f.dstname,
+		Packing:    f.packer.Packing(),
 		Time:       upspin.Now(),
 		Sequence:   upspin.SeqIgnore,
 		Writer:     f.client.Config().UserName(),
@@ -145,14 +129,25 @@ func Writable(client upspin.Client, name upspin.PathName) (*File, error) {
 	}
 
 	if !f.bufferAll {
-		bp, err := packer.Pack(client.Config(), f.entry)
+		bp, err := f.packer.Pack(f.client.Config(), f.entry)
 		if err != nil {
-			return nil, err
+			return errors.E(op, f.name, err)
 		}
 		f.bp = bp
 	}
 
-	return f, nil
+	return nil
+}
+
+// Writable creates a new file with a given name, belonging to a given
+// client for write. Once closed, the file will overwrite any existing
+// file with the same name.
+func Writable(client upspin.Client, name upspin.PathName) *File {
+	return &File{
+		client:   client,
+		name:     name,
+		writable: true,
+	}
 }
 
 // Name implements upspin.File.
@@ -243,13 +238,19 @@ func (f *File) readAt(op string, dst []byte, off int64) (n int, err error) {
 }
 
 // switchBufferAll puts the file into full buffering mode from a streaming-write mode.
-func (f *File) switchBufferAll() error {
+func (f *File) switchBufferAll(op string) error {
 	if f.bufferAll {
 		return nil
 	}
+
+	if f.bp == nil {
+		f.bufferAll = true
+		return nil
+	}
+
 	err := f.bp.Close()
 	if err != nil {
-		return err
+		return errors.E(op, f.name, err)
 	}
 
 	f.bufferAll = true
@@ -268,7 +269,7 @@ func (f *File) Seek(offset int64, whence int) (ret int64, err error) {
 	if f.closed {
 		return 0, f.errClosed(op)
 	}
-	if err := f.switchBufferAll(); err != nil {
+	if err := f.switchBufferAll(op); err != nil {
 		return 0, errors.E(op, err)
 	}
 
@@ -303,20 +304,24 @@ func (f *File) Write(b []byte) (n int, err error) {
 		return n, err
 	}
 
-	err = f.streamingWrite(op, false)
-	if err != nil {
-		return 0, err
+	if !f.bufferAll {
+		err = f.streamingWrite(op, false)
+		if err != nil {
+			return 0, err
+		}
 	}
 	return n, err
 }
 
 func (f *File) streamingWrite(op string, final bool) error {
+	m, s := newMetric(op)
+	defer m.Done()
+
+	f.initWrite(op, s)
 	if f.bufferAll || len(f.data) < flags.BlockSize {
 		return nil
 	}
 
-	m, s := newMetric(op)
-	defer m.Done()
 	ss := s.StartSpan("pack")
 	if err := f.pack(f.entry, ss, final); err != nil {
 		return errors.E(op, err)
@@ -365,7 +370,7 @@ func (f *File) pack(entry *upspin.DirEntry, s *metric.Span, final bool) error {
 // WriteAt implements upspin.File.
 func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
 	const op = "file.WriteAt"
-	if err := f.switchBufferAll(); err != nil {
+	if err := f.switchBufferAll(op); err != nil {
 		return 0, errors.E(op, err)
 	}
 	return f.writeAt(op, b, off)
@@ -378,6 +383,7 @@ func (f *File) writeAt(op string, b []byte, off int64) (n int, err error) {
 	if !f.writable {
 		return 0, errors.E(op, errors.Invalid, f.name, errors.Errorf("not open for write"))
 	}
+
 	if off < 0 {
 		return 0, errors.E(op, errors.Invalid, f.name, errors.Errorf("negative offset"))
 	}
@@ -419,6 +425,7 @@ func (f *File) Close() (err error) {
 		}
 		return nil
 	}
+
 	if f.bufferAll {
 		err = f.validateAccess(op)
 		if err != nil {
