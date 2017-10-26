@@ -112,9 +112,9 @@ func (f *File) initWrite(op string, s *metric.Span) error {
 	f.accessEntry = accessEntry
 
 	// Encrypt data according to the preferred packer
-	f.packer = pack.Lookup(f.client.Config().Packing())
+	f.packer = pack.Lookup(f.config.Packing())
 	if f.packer == nil {
-		return errors.E(op, f.name, errors.Errorf("unrecognized Packing %d", f.client.Config().Packing()))
+		return errors.E(op, f.name, errors.Errorf("unrecognized Packing %d", f.config.Packing()))
 	}
 
 	f.entry = &upspin.DirEntry{
@@ -123,13 +123,13 @@ func (f *File) initWrite(op string, s *metric.Span) error {
 		Packing:    f.packer.Packing(),
 		Time:       upspin.Now(),
 		Sequence:   upspin.SeqIgnore,
-		Writer:     f.client.Config().UserName(),
+		Writer:     f.config.UserName(),
 		Link:       "",
 		Attr:       upspin.AttrNone,
 	}
 
 	if !f.bufferAll {
-		bp, err := f.packer.Pack(f.client.Config(), f.entry)
+		bp, err := f.packer.Pack(f.config, f.entry)
 		if err != nil {
 			return errors.E(op, f.name, err)
 		}
@@ -145,6 +145,7 @@ func (f *File) initWrite(op string, s *metric.Span) error {
 func Writable(client upspin.Client, name upspin.PathName) *File {
 	return &File{
 		client:   client,
+		config:   client.Config(),
 		name:     name,
 		writable: true,
 	}
@@ -318,7 +319,7 @@ func (f *File) streamingWrite(op string, final bool) error {
 	defer m.Done()
 
 	f.initWrite(op, s)
-	if f.bufferAll || len(f.data) < flags.BlockSize {
+	if f.bufferAll || (len(f.data) < flags.BlockSize && !final) {
 		return nil
 	}
 
@@ -359,10 +360,13 @@ func (f *File) pack(entry *upspin.DirEntry, s *metric.Span, final bool) error {
 		}
 		f.bp.SetLocation(
 			upspin.Location{
-				Endpoint:  f.client.Config().StoreEndpoint(),
+				Endpoint:  f.config.StoreEndpoint(),
 				Reference: refdata.Reference,
 			},
 		)
+		if final {
+			break
+		}
 	}
 	return nil
 }
@@ -450,7 +454,7 @@ func (f *File) endStreamingWrite(op string) error {
 	if err != nil {
 		return errors.E(op, f.name, err)
 	}
-	if err := clientutil.AddReaders(f.client.Config(), op, f.entry, f.packer, readers); err != nil {
+	if err := clientutil.AddReaders(f.config, op, f.entry, f.packer, readers); err != nil {
 		return errors.E(op, f.name, err)
 	}
 
